@@ -1,0 +1,140 @@
+version: 2.1
+
+env: &env
+  environment:
+    nholuongut_INSTALLER_VERSION: v0.0.33
+    TERRATEST_LOG_PARSER_VERSION: v0.30.4
+    MODULE_CI_VERSION: v0.29.2
+    MODULE_GCP_CI_VERSION: v0.1.1
+    TERRAFORM_VERSION: 1.0.4
+    TERRAGRUNT_VERSION: NONE
+    PACKER_VERSION: NONE
+    GOLANG_VERSION: 1.14
+
+defaults: &defaults
+  machine:
+    image: ubuntu-2004:202104-01
+  <<: *env
+
+install_nholuongut_utils: &install_nholuongut_utils
+  name: install nholuongut utils
+  command: |
+    curl -Ls https://raw.githubusercontent.com/nholuongut/nholuongut-installer/main/bootstrap-nholuongut-installer.sh | bash /dev/stdin --version "${nholuongut_INSTALLER_VERSION}"
+    nholuongut-install --module-name "nholuongut-module-circleci-helpers" --repo "https://github.com/nholuongut/terraform-aws-ci" --tag "${MODULE_CI_VERSION}"
+    nholuongut-install --binary-name "terratest_log_parser" --repo "https://github.com/nholuongut/terratest" --tag "${TERRATEST_LOG_PARSER_VERSION}"
+    nholuongut-install --module-name "kubernetes-circleci-helpers" --repo "https://github.com/nholuongut/terraform-aws-ci" --tag "${MODULE_CI_VERSION}"
+    # TODO: switch to the release version once this PR is merged.
+    nholuongut-install --module-name "gcp-helpers" --repo "https://github.com/nholuongut/terraform-google-ci" --tag "${MODULE_GCP_CI_VERSION}"
+    configure-environment-for-nholuongut-module \
+      --terraform-version ${TERRAFORM_VERSION} \
+      --terragrunt-version ${TERRAGRUNT_VERSION} \
+      --packer-version ${PACKER_VERSION} \
+      --go-version ${GOLANG_VERSION}
+
+configure_environment_for_gcp: &configure_environment_for_gcp
+  name: configure environment for gcp
+  command: |
+    # install the Google Cloud SDK CLI
+    install-gcloud
+    # Make GCP Service Account credentials available as a file
+    echo $GCLOUD_SERVICE_KEY > ${HOME}/gcloud-service-key.json
+    echo 'export GOOGLE_APPLICATION_CREDENTIALS=${HOME}/gcloud-service-key.json' >> $BASH_ENV
+    # Tell gcloud to use the credentials and set defaults
+    echo $GCLOUD_SERVICE_KEY | gcloud auth activate-service-account --key-file=-
+    gcloud --quiet config set project ${GOOGLE_PROJECT_ID}
+    gcloud --quiet config set compute/zone ${GOOGLE_COMPUTE_ZONE}
+
+jobs:
+  setup:
+    <<: *env
+    docker:
+      - image: circleci/python:3.8.5
+
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+          - gomod-{{ checksum "go.sum" }}
+
+      # Install nholuongut utilities
+      - run:
+          <<: *install_nholuongut_utils
+
+      - save_cache:
+          key: gomod-{{ checksum "go.sum" }}
+          paths:
+          - $HOME/go/src/
+
+      # The weird way you have to set PATH in Circle 2.0
+      - run: echo 'export PATH=$HOME/.local/bin:$HOME/go/bin:$HOME/terraform:$HOME/packer:$PATH' >> $BASH_ENV
+
+      # Run pre-commit hooks and fail the build if any hook finds required changes.
+      - run:
+          name: run precommit
+          command: |
+            go get golang.org/x/tools/cmd/goimports
+            # Install the latest minor version for v2
+            pip install pre-commit~=2.9
+            pre-commit install
+            pre-commit run --all-files
+
+      - persist_to_workspace:
+          root: /home/circleci
+          paths:
+            - project
+
+  test:
+    <<: *defaults
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+
+      - run:
+          <<: *install_nholuongut_utils
+
+      # The weird way you have to set PATH in Circle 2.0
+      - run: echo 'export PATH=$HOME/.local/bin:$HOME/terraform:$HOME/packer:$PATH' >> $BASH_ENV
+
+      - run:
+          <<: *configure_environment_for_gcp
+
+      # Run the tests.
+      - run:
+          name: run tests
+          command: |
+            # run the tests
+            mkdir -p /tmp/logs
+            run-go-tests --path test --timeout 2h | tee /tmp/logs/all.log
+          no_output_timeout: 1h
+
+      - run:
+          name: parse test output
+          command: terratest_log_parser --testlog /tmp/logs/all.log --outputdir /tmp/logs
+          when: always
+
+      - store_artifacts:
+          path: /tmp/logs
+      - store_test_results:
+          path: /tmp/logs
+
+workflows:
+  version: 2
+  build-and-test:
+    jobs:
+      - setup:
+          context:
+            - GCP__automated-tests
+            - GITHUB__PAT__nholuongut-ci
+          filters:
+            tags:
+              only: /^v.*/
+
+      - test:
+          context:
+            - GCP__automated-tests
+            - GITHUB__PAT__nholuongut-ci
+          requires:
+            - setup
+          filters:
+            tags:
+              only: /^v.*/
